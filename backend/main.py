@@ -14,10 +14,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPBearer
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from logger import get_logger
@@ -38,17 +38,16 @@ _LOCAL_ORIGIN_RE = r"^(tauri://localhost|https?://(localhost|127\.0\.0\.1|tauri\
 _bearer = HTTPBearer(auto_error=False)
 
 
-def _require_token(
-    request: Request,
-    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
-):
-    if request.url.path == "/health":
-        return
-    if creds is None or creds.credentials != _API_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="invalid token",
-        )
+async def _require_ws_token(ws: WebSocket) -> bool:
+    """Auth guard for WebSocket routes; token via query param or header."""
+    token = ws.query_params.get("token", "")
+    if token == _API_TOKEN:
+        return True
+    auth = ws.headers.get("authorization", "")
+    if auth.startswith("Bearer ") and auth[7:] == _API_TOKEN:
+        return True
+    await ws.close(code=4401, reason="invalid token")
+    return False
 
 
 LeadStatus = Literal[
@@ -83,6 +82,16 @@ class ManualLeadBody(StrictBody):
     text: str = Field(default="", max_length=20000)
     url: str = Field(default="", max_length=2000)
     kind: Literal["job"] = "job"
+
+
+class HelpMessage(StrictBody):
+    role: Literal["user", "assistant"]
+    content: str = Field(default="", max_length=4000)
+
+
+class HelpChatBody(StrictBody):
+    question: str = Field(max_length=2000)
+    history: list[HelpMessage] = Field(default_factory=list, max_length=12)
 
 
 class TemplateBody(StrictBody):
@@ -167,15 +176,10 @@ cm = _CM()
 DEFAULT_JOB_TARGETS = [
     "hn-hiring",
     "https://remoteok.com/api",
-    "https://remotive.com/api/remote-jobs?search=junior",
-    "https://remotive.com/api/remote-jobs?search=python",
-    "https://remotive.com/api/remote-jobs?search=react",
-    "https://remotive.com/api/remote-jobs?search=ai",
-    "https://jobicy.com/api/v2/remote-jobs?count=50&tag=python",
-    "https://jobicy.com/api/v2/remote-jobs?count=50&tag=react",
+    "https://remotive.com/api/remote-jobs",
+    "https://jobicy.com/api/v2/remote-jobs?count=50",
     "https://jobicy.com/feed/newjobs",
-    "https://weworkremotely.com/categories/remote-programming-jobs.rss",
-    "https://weworkremotely.com/categories/remote-full-stack-programming-jobs.rss",
+    "https://weworkremotely.com/remote-jobs.rss",
     "site:boards.greenhouse.io",
     "site:jobs.lever.co",
     "site:jobs.ashbyhq.com",
@@ -183,18 +187,24 @@ DEFAULT_JOB_TARGETS = [
     "site:wellfound.com/jobs",
     "site:linkedin.com/jobs",
     "site:indeed.com/jobs",
+    "site:glassdoor.com/Job",
+    "site:jobs.smartrecruiters.com",
+    "site:workdayjobs.com",
     "site:naukri.com",
     "site:instahyre.com",
     "site:cutshort.io/jobs",
 ]
 
 INDIA_JOB_TARGETS = [
-    "site:wellfound.com/jobs India startup",
-    "site:cutshort.io/jobs software engineer India startup",
-    "site:instahyre.com software engineer India",
-    "site:naukri.com software engineer startup India",
-    "site:linkedin.com/jobs software engineer India startup",
-    "site:indeed.com/jobs software engineer India startup",
+    "site:wellfound.com/jobs India",
+    "site:cutshort.io/jobs India startup",
+    "site:instahyre.com jobs India",
+    "site:naukri.com jobs India",
+    "site:foundit.in jobs India",
+    "site:internshala.com/jobs India",
+    "site:linkedin.com/jobs India",
+    "site:indeed.com/jobs India",
+    "site:glassdoor.co.in Job India",
     "site:boards.greenhouse.io India",
     "site:jobs.lever.co India",
     "site:jobs.ashbyhq.com India",
@@ -262,12 +272,77 @@ def _job_targets(raw: str, market_focus: str = "global") -> list[str]:
         india_markers = (
             "india", "indian", "bangalore", "bengaluru", "mumbai", "delhi",
             "gurgaon", "gurugram", "hyderabad", "pune", "chennai", "noida",
-            "cutshort", "instahyre", "naukri",
+            "cutshort", "instahyre", "naukri", "foundit", "internshala",
+            "glassdoor.co.in",
         )
         filtered = [target for target in filtered if any(marker in target.lower() for marker in india_markers)]
 
     fallback = INDIA_JOB_TARGETS if focus == "india" else DEFAULT_JOB_TARGETS
     return _dedupe_targets(filtered) or list(fallback)
+
+
+def _desired_position(cfg: dict) -> str:
+    for key in ("desired_position", "target_position", "target_role", "onboarding_target_role"):
+        value = str(cfg.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _profile_for_discovery(profile: dict | None, cfg: dict) -> dict:
+    """Merge the saved profile with the user's explicit desired role for scraping."""
+    profile = dict(profile or {})
+    desired = _desired_position(cfg)
+    if desired:
+        summary = str(profile.get("s") or "").strip()
+        if desired.lower() not in summary.lower():
+            profile["s"] = f"{desired}. {summary}".strip()
+        else:
+            profile["s"] = summary or desired
+        profile["desired_position"] = desired
+    return profile
+
+
+def _terms_for_discovery(profile: dict, limit: int = 4) -> list[str]:
+    terms: list[str] = []
+    summary = str(profile.get("desired_position") or profile.get("s") or "").strip()
+    if summary:
+        terms.append(" ".join(summary.split()[:5]))
+    for exp in profile.get("exp", []) or []:
+        if isinstance(exp, dict) and exp.get("role"):
+            terms.append(str(exp["role"]))
+    for skill in profile.get("skills", []) or []:
+        if isinstance(skill, dict) and skill.get("n"):
+            terms.append(str(skill["n"]))
+    seen: set[str] = set()
+    out: list[str] = []
+    for term in terms:
+        term = re.sub(r"\s+", " ", str(term)).strip(" ,.;:-")
+        key = term.lower()
+        if term and key not in seen:
+            seen.add(key)
+            out.append(term)
+    return out[:limit] or ["jobs"]
+
+
+def _profile_free_source_targets(profile: dict) -> str:
+    terms = _terms_for_discovery(profile, 3)
+    role_query = " ".join(terms[:2])
+    return "\n".join([
+        f"github:{role_query} hiring help wanted",
+        f"hn:{role_query} remote hiring",
+        f"reddit:forhire:{role_query} hiring job remote",
+    ])
+
+
+def _profile_x_queries(profile: dict, market_focus: str = "global") -> str:
+    terms = _terms_for_discovery(profile, 4)
+    role = " OR ".join(f'"{term}"' for term in terms[:3])
+    location = '("India" OR "Indian" OR "Bengaluru" OR "Mumbai" OR "Pune" OR "Hyderabad")' if _job_market_focus(market_focus) == "india" else '("remote" OR "hybrid" OR "global" OR "onsite")'
+    return "\n".join([
+        f'("hiring" OR "job opening" OR "open role") ({role}) {location} lang:en -is:retweet',
+        f'("we are hiring" OR "is hiring" OR "apply") ({role}) lang:en -is:retweet',
+    ])
 
 
 def _has_x_token(cfg: dict) -> bool:
@@ -299,7 +374,7 @@ async def _broadcast_x_source_errors(errors: list[str]):
         await cm.broadcast({"type": "agent", "event": "x_source_error", "msg": f"{len(errors) - 3} more X queries were skipped"})
 
 
-async def _run_x_signal_scan(cfg: dict, kind_filter: str) -> list[dict]:
+async def _run_x_signal_scan(cfg: dict, kind_filter: str, profile: dict | None = None) -> list[dict]:
     if not _has_x_token(cfg):
         return []
 
@@ -311,7 +386,7 @@ async def _run_x_signal_scan(cfg: dict, kind_filter: str) -> list[dict]:
     leads = await asyncio.to_thread(
         x_scout.run,
         bearer_token=cfg.get("x_bearer_token") or None,
-        raw_queries=cfg.get("x_search_queries", ""),
+        raw_queries=cfg.get("x_search_queries", "") or _profile_x_queries(profile or {}, cfg.get("job_market_focus", "global")),
         raw_watchlist=cfg.get("x_watchlist", ""),
         kind_filter=kind_filter,
         max_requests=_int_cfg(cfg, "x_max_requests_per_scan", 5, 1, 50),
@@ -340,7 +415,7 @@ async def _run_x_signal_scan(cfg: dict, kind_filter: str) -> list[dict]:
 
 # ── Scan stop flag ─────────────────────────────────────────────────────────────
 # Set by /api/v1/scan/stop; cleared when a new scan is accepted.
-async def _run_free_source_scan(cfg: dict, kind_filter: str | None = None) -> list[dict]:
+async def _run_free_source_scan(cfg: dict, kind_filter: str | None = None, profile: dict | None = None) -> list[dict]:
     if not _free_sources_enabled(cfg):
         return []
 
@@ -351,8 +426,11 @@ async def _run_free_source_scan(cfg: dict, kind_filter: str | None = None) -> li
     await cm.broadcast({"type": "agent", "event": "free_scout_start", "msg": f"Scanning free sources for {label}..."})
     leads = await asyncio.to_thread(
         free_scout.run,
-        raw_targets=cfg.get("free_source_targets", ""),
+        raw_targets=cfg.get("free_source_targets", "") or _profile_free_source_targets(profile or {}),
         raw_watchlist=cfg.get("company_watchlist", ""),
+        raw_custom_connectors=cfg.get("custom_connectors", ""),
+        raw_custom_headers=cfg.get("custom_connector_headers", ""),
+        custom_connectors_enabled=_truthy(cfg.get("custom_connectors_enabled", "false")),
         kind_filter=kind_filter,
         max_requests=_int_cfg(cfg, "free_source_max_requests", 20, 1, 80),
         min_signal_score=_int_cfg(cfg, "free_source_min_signal_score", 60, 0, 100),
@@ -398,20 +476,20 @@ async def _ghost_tick():
     from agents.scout import run as _scout
     from agents.evaluator import score as _score
     from agents.generator import run_package as _gen
+    from agents.query_gen import generate as _gen_queries
 
     cfg = get_settings()
     if get_setting("ghost_mode") != "true":
         return
 
+    profile = _profile_for_discovery(await asyncio.to_thread(get_profile), cfg)
     boards = _job_targets(cfg.get("job_boards", ""), cfg.get("job_market_focus", "global"))
     has_x = _has_x_token(cfg)
     has_free = _free_sources_enabled(cfg)
-    profile = None
     if has_x:
-        profile = await asyncio.to_thread(get_profile)
-        await _run_x_signal_scan(cfg, "job")
+        await _run_x_signal_scan(cfg, "job", profile)
     if has_free:
-        await _run_free_source_scan(cfg, "job")
+        await _run_free_source_scan(cfg, "job", profile)
     if not boards and not has_x and not has_free:
         await cm.broadcast({"type": "agent", "event": "ghost_warn", "msg": "Ghost Mode: no job boards configured — skipping"})
         return
@@ -419,6 +497,7 @@ async def _ghost_tick():
     # ── Step 1: Scout ──────────────────────────────────────────────
     await cm.broadcast({"type": "agent", "event": "ghost_scout", "msg": "Ghost Mode: scout cycle starting"})
     try:
+        boards = await asyncio.to_thread(_gen_queries, profile, boards, cfg.get("job_market_focus", "global"))
         leads = await asyncio.to_thread(
             _scout,
             urls=boards,
@@ -432,7 +511,7 @@ async def _ghost_tick():
         return
 
     # ── Step 2: Evaluate ───────────────────────────────────────────
-    profile = await asyncio.to_thread(get_profile)
+    profile = _profile_for_discovery(await asyncio.to_thread(get_profile), cfg)
     discovered = await asyncio.to_thread(get_discovered_leads)
     await cm.broadcast({"type": "agent", "event": "ghost_eval",
                         "msg": f"Ghost Mode: evaluating {len(discovered)} leads"})
@@ -540,7 +619,6 @@ app = FastAPI(
     title="JustHireMe",
     version="0.1.0",
     lifespan=lifespan,
-    dependencies=[Depends(_require_token)],
 )
 app.add_middleware(
     CORSMiddleware,
@@ -549,6 +627,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def require_http_token(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path == "/health":
+        return await call_next(request)
+    if request.url.path != "/health":
+        creds = await _bearer(request)
+        if creds is None or creds.credentials != _API_TOKEN:
+            return JSONResponse(
+                {"detail": "invalid token"},
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
+    return await call_next(request)
 
 
 @app.get("/health", dependencies=[])
@@ -643,7 +735,7 @@ async def get_lead_versions(job_id: str):
     ]
     base_dir = next((os.path.dirname(path) for path in paths if path), None)
     if not base_dir:
-        base_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "BoomBoom", "assets")
+        base_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JustHireMe", "assets")
     return _versioned_assets(job_id, base_dir)
 
 
@@ -753,9 +845,9 @@ async def due_followups(limit: int = 25):
 
 
 @app.post("/api/v1/leads/{job_id}/generate")
-async def generate_for_lead(job_id: str, bt: BackgroundTasks):
-    bt.add_task(_generate_one, job_id)
-    return {"status": "generating", "job_id": job_id}
+async def generate_for_lead(job_id: str):
+    lead = await _generate_one(job_id)
+    return {"status": "ready", "job_id": job_id, "lead": lead}
 
 
 @app.post("/api/v1/leads/{job_id}/pipeline/run")
@@ -812,7 +904,7 @@ async def get_lead_pdf(job_id: str, kind: str = "resume", version: int | None = 
         ]
         base_dir = next((os.path.dirname(path) for path in paths if path), None)
         if not base_dir:
-            base_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "BoomBoom", "assets")
+            base_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JustHireMe", "assets")
         filename = f"{job_id}_cl_v{version}.pdf" if is_cover else f"{job_id}_v{version}.pdf"
         path = os.path.join(base_dir, filename)
         missing = "Cover letter not generated yet" if is_cover else "Resume not generated yet"
@@ -850,12 +942,8 @@ async def get_events_endpoint(limit: int = 100, job_id: str | None = None):
 
 @app.get("/api/v1/graph")
 async def graph_stats():
-    from db.client import conn
-    out = {}
-    for t in ["Candidate", "Skill", "Project", "Experience", "JobLead"]:
-        r = conn.execute(f"MATCH (n:{t}) RETURN count(n)")
-        out[t.lower()] = r.get_next()[0] if r.has_next() else 0
-    return out
+    from db.client import graph_counts
+    return graph_counts()
 
 
 @app.get("/api/v1/profile")
@@ -1017,10 +1105,19 @@ async def cleanup_leads(dry_run: bool = False, limit: int = 1000):
 
 @app.post("/api/v1/free-sources/scan")
 async def free_sources_scan():
-    from db.client import get_settings
+    from db.client import get_settings, get_profile
     cfg = get_settings()
-    leads = await _run_free_source_scan(cfg, "job")
+    profile = _profile_for_discovery(await asyncio.to_thread(get_profile), cfg)
+    leads = await _run_free_source_scan(cfg, "job", profile)
     return {"status": "done", "leads": len(leads)}
+
+
+@app.post("/api/v1/help/chat")
+async def help_chat(body: HelpChatBody):
+    from agents.help_agent import answer
+
+    history = [item.model_dump() for item in body.history]
+    return await asyncio.to_thread(answer, body.question, history)
 
 
 async def _run_scan_task():
@@ -1109,11 +1206,11 @@ async def _run_scan():
     from agents.query_gen import generate as _gen_queries
 
     cfg     = get_settings()
-    profile = get_profile()
+    profile = _profile_for_discovery(get_profile(), cfg)
     market_focus = cfg.get("job_market_focus", "global")
     raw_urls = _job_targets(cfg.get("job_boards", ""), market_focus)
-    await _run_x_signal_scan(cfg, "job")
-    await _run_free_source_scan(cfg, "job")
+    await _run_x_signal_scan(cfg, "job", profile)
+    await _run_free_source_scan(cfg, "job", profile)
 
     # ── Replace static site: keywords with profile-tailored queries ──────
     await cm.broadcast({"type": "agent", "event": "query_gen_start",
@@ -1174,7 +1271,7 @@ async def _run_scan():
 
 def _sensitive(d: dict) -> set:
     """Keys that should be masked on reads and preserved on writes."""
-    fixed = {"anthropic_key", "linkedin_cookie", "x_bearer_token"}
+    fixed = {"anthropic_key", "linkedin_cookie", "x_bearer_token", "custom_connector_headers"}
     dynamic = {k for k in d if k.endswith("_api_key") or k.endswith("_key") or k.endswith("_token")}
     return fixed | dynamic
 
@@ -1192,6 +1289,7 @@ async def get_cfg():
 
 async def _probe_provider_key(provider: str, key: str) -> dict:
     import httpx
+    from llm import _OPENAI_COMPAT_BASE_URLS
 
     started = time.perf_counter()
     try:
@@ -1224,6 +1322,18 @@ async def _probe_provider_key(provider: str, key: str) -> dict:
                     headers={"Authorization": f"Bearer {key}"},
                 )
                 status = "ok" if r.status_code == 200 else "invalid_key" if r.status_code == 401 else "unreachable"
+            elif provider == "gemini":
+                r = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/openai/models",
+                    headers={"Authorization": f"Bearer {key}"},
+                )
+                status = "ok" if r.status_code == 200 else "invalid_key" if r.status_code in {401, 403} else "unreachable"
+            elif provider in _OPENAI_COMPAT_BASE_URLS:
+                r = await client.get(
+                    f"{_OPENAI_COMPAT_BASE_URLS[provider].rstrip('/')}/models",
+                    headers={"Authorization": f"Bearer {key}"},
+                )
+                status = "ok" if r.status_code == 200 else "invalid_key" if r.status_code in {401, 403} else "unreachable"
             else:
                 status = "unchecked"
     except Exception:
@@ -1234,17 +1344,23 @@ async def _probe_provider_key(provider: str, key: str) -> dict:
 @app.get("/api/v1/settings/validate")
 async def validate_settings():
     from db.client import get_settings
-    from llm import _ENV_NAMES, _KEY_NAMES
+    from llm import _ENV_NAMES, _KEY_NAMES, _OPENAI_COMPAT_BASE_URLS
 
     cfg = get_settings()
-    providers = ["anthropic", "openai", "groq", *[p for p in _KEY_NAMES if p not in {"anthropic", "openai", "groq"}]]
+    probed = {"anthropic", "gemini", "openai", "groq", *_OPENAI_COMPAT_BASE_URLS}
+    providers = ["anthropic", "gemini", "openai", "groq", *[p for p in _KEY_NAMES if p not in {"anthropic", "gemini", "openai", "groq"}]]
 
     async def one(provider: str):
         key_name = _KEY_NAMES.get(provider, "")
-        key = str(cfg.get(key_name) or os.environ.get(_ENV_NAMES.get(provider, ""), "") or "").strip()
+        key = str(
+            cfg.get(key_name)
+            or os.environ.get(_ENV_NAMES.get(provider, ""), "")
+            or (os.environ.get("GOOGLE_API_KEY", "") if provider == "gemini" else "")
+            or ""
+        ).strip()
         if not key:
             return provider, {"status": "not_configured", "latency_ms": 0}
-        if provider not in {"anthropic", "openai", "groq"}:
+        if provider not in probed:
             return provider, {"status": "unchecked", "latency_ms": 0}
         return provider, await _probe_provider_key(provider, key)
 
@@ -1716,7 +1832,7 @@ async def _generate_one(jid: str):
     lead = get_lead_by_id(jid)
     if not lead:
         await cm.broadcast({"type": "agent", "event": "gen_error", "msg": f"Lead {jid} not found"})
-        return
+        raise HTTPException(status_code=404, detail="Lead not found")
     template = get_setting("resume_template", "")
     await cm.broadcast({"type": "agent", "event": "gen_start",
                         "msg": f"Generating for {lead.get('title','?')} @ {lead.get('company','?')}"})
@@ -1767,9 +1883,11 @@ async def _generate_one(jid: str):
             **enriched_lead,
         }})
         await cm.broadcast({"type": "agent", "event": "gen_done", "msg": f"Resume and cover letter ready: {lead.get('title','?')}"})
+        return enriched_lead
     except Exception as exc:
         await cm.broadcast({"type": "agent", "event": "gen_error",
                             "msg": f"Generation failed for {lead.get('title','?')}: {exc}"})
+        raise HTTPException(status_code=500, detail=f"Generation failed: {exc}") from exc
 
 
 async def _actuate(jid: str):
@@ -1802,6 +1920,8 @@ async def _actuate(jid: str):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    if not await _require_ws_token(ws):
+        return
     await ws.accept()
     await cm.add(ws)
     beat = 0

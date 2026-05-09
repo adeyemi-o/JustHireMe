@@ -1,7 +1,6 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+#[cfg(debug_assertions)]
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -13,6 +12,7 @@ use tauri_plugin_shell::ShellExt;
 struct SidecarPort(Mutex<Option<u16>>);
 struct ApiTokenState(Mutex<Option<String>>);
 struct SidecarChild(Mutex<Option<CommandChild>>);
+struct SidecarError(Mutex<Option<String>>);
 
 #[tauri::command]
 fn get_sidecar_port(state: State<SidecarPort>) -> Result<u16, String> {
@@ -34,6 +34,16 @@ fn get_api_token(state: State<ApiTokenState>) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn get_sidecar_error(state: State<SidecarError>) -> Result<String, String> {
+    state
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "No sidecar error recorded".into())
+}
+
+#[tauri::command]
 fn notify_high_score_lead(app: tauri::AppHandle, title: String, body: String) {
     use tauri_plugin_notification::NotificationExt;
 
@@ -45,6 +55,7 @@ fn notify_high_score_lead(app: tauri::AppHandle, title: String, body: String) {
         .show();
 }
 
+#[cfg(debug_assertions)]
 fn bundled_python_path(app: &AppHandle) -> Option<PathBuf> {
     let runtime_dir = app
         .path()
@@ -65,6 +76,7 @@ fn bundled_python_path(app: &AppHandle) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+#[cfg(debug_assertions)]
 fn local_venv_python_path(backend_dir: &Path) -> Option<PathBuf> {
     let candidates = if cfg!(windows) {
         vec![".venv/Scripts/python.exe", ".venv/Scripts/python"]
@@ -128,15 +140,19 @@ fn shutdown_sidecar(app: &AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .manage(SidecarPort(Mutex::new(None)))
         .manage(ApiTokenState(Mutex::new(None)))
         .manage(SidecarChild(Mutex::new(None)))
+        .manage(SidecarError(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_sidecar_port,
             get_api_token,
+            get_sidecar_error,
             notify_high_score_lead
         ])
         .setup(|app| {
@@ -157,7 +173,9 @@ pub fn run() {
                 } else if let Some(ref py) = local_venv {
                     eprintln!("[tauri] Using backend virtualenv: {}", py.display());
                 } else {
-                    eprintln!("[tauri] No bundled or virtualenv runtime found - falling back to `uv`");
+                    eprintln!(
+                        "[tauri] No bundled or virtualenv runtime found - falling back to `uv`"
+                    );
                 }
 
                 if let Some(py) = bundled {
@@ -184,13 +202,62 @@ pub fn run() {
             #[cfg(not(debug_assertions))]
             let sidecar_cmd = {
                 eprintln!("[tauri] Using bundled backend sidecar");
+                // Tauri installs externalBin sidecars beside the app executable under
+                // the binary basename, so this resolves to jhm-sidecar.exe on Windows.
                 handle
                     .shell()
-                    .sidecar("backend")
+                    .sidecar("jhm-sidecar")
                     .expect("failed to create sidecar command")
             };
 
-            let (mut rx, child) = sidecar_cmd.spawn().expect("Failed to spawn Python sidecar");
+            let mut sidecar_cmd = sidecar_cmd;
+            sidecar_cmd = sidecar_cmd.env("PYTHONUNBUFFERED", "1");
+            if let Ok(app_data_dir) = handle.path().app_data_dir() {
+                let _ = std::fs::create_dir_all(&app_data_dir);
+                let app_data = app_data_dir.to_string_lossy().to_string();
+                sidecar_cmd = sidecar_cmd
+                    .env("LOCALAPPDATA", app_data.clone())
+                    .env("JHM_APP_DATA_DIR", app_data);
+            }
+            if let Ok(resource_dir) = handle.path().resource_dir() {
+                let bundled_browsers_path = resource_dir
+                    .join("resources")
+                    .join("bin")
+                    .join("ms-playwright");
+                if bundled_browsers_path.exists() {
+                    sidecar_cmd = sidecar_cmd.env(
+                        "PLAYWRIGHT_BROWSERS_PATH",
+                        bundled_browsers_path.to_string_lossy().to_string(),
+                    );
+                }
+            }
+            if let Ok(app_data_dir) = handle.path().app_data_dir() {
+                let browser_cache = app_data_dir.join("browser-runtime").join("ms-playwright");
+                sidecar_cmd = sidecar_cmd.env(
+                    "JHM_BROWSER_RUNTIME_DIR",
+                    browser_cache.to_string_lossy().to_string(),
+                );
+                if !browser_cache.exists() {
+                    let _ = std::fs::create_dir_all(&browser_cache);
+                }
+                sidecar_cmd = sidecar_cmd.env(
+                    "PLAYWRIGHT_BROWSERS_PATH",
+                    browser_cache.to_string_lossy().to_string(),
+                );
+            }
+
+            let (mut rx, child) = match sidecar_cmd.spawn() {
+                Ok(result) => result,
+                Err(err) => {
+                    let msg = format!("Failed to spawn Python sidecar: {err}");
+                    eprintln!("[tauri] {msg}");
+                    if let Ok(mut guard) = handle.state::<SidecarError>().0.lock() {
+                        *guard = Some(msg.clone());
+                    }
+                    let _ = handle.emit("sidecar-error", msg);
+                    return Ok(());
+                }
+            };
 
             let sidecar_pid = child.pid();
             eprintln!("[tauri] Sidecar PID: {sidecar_pid}");
@@ -224,10 +291,19 @@ pub fn run() {
                             let line = String::from_utf8_lossy(&b).trim().to_string();
                             if !line.is_empty() {
                                 eprintln!("[sidecar] {line}");
+                                if let Ok(mut guard) = app_handle.state::<SidecarError>().0.lock() {
+                                    *guard = Some(line.clone());
+                                }
+                                let _ = app_handle.emit("sidecar-error", line);
                             }
                         }
                         CommandEvent::Terminated(s) => {
                             eprintln!("[tauri] Sidecar terminated: {:?}", s.code);
+                            let msg = format!("Sidecar terminated before startup: {:?}", s.code);
+                            if let Ok(mut guard) = app_handle.state::<SidecarError>().0.lock() {
+                                *guard = Some(msg.clone());
+                            }
+                            let _ = app_handle.emit("sidecar-error", msg);
                             let _ = app_handle.emit("sidecar-terminated", ());
                         }
                         _ => {}

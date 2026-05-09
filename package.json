@@ -1,7 +1,17 @@
 {
   "name": "justhireme",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.25",
+  "description": "Local-first AI job intelligence workbench for scraping, ranking, and tailoring applications.",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vasu-devs/JustHireMe.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vasu-devs/JustHireMe/issues"
+  },
+  "homepage": "https://github.com/vasu-devs/JustHireMe#readme",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,13 +20,21 @@
     "build": "tsc && vite build",
     "check": "npm run build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "package:fast": "tauri build --no-bundle",
+    "package:windows": "tauri build --bundles nsis",
+    "package:windows:all": "tauri build --bundles nsis msi",
+    "package:windows:msi": "tauri build --bundles msi",
+    "package:linux": "tauri build --bundles deb appimage",
+    "package:macos": "tauri build --bundles app,dmg"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.2.4",
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2.3.5",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "framer-motion": "^12.38.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

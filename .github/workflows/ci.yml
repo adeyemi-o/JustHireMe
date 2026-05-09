@@ -10,37 +10,94 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=moderate
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Audit backend dependencies
+        run: cd backend && uv sync --dev && uv run --with pip-audit pip-audit
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cd src-tauri
+          cargo audit
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
 
+  website:
+    name: Website
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
   backend:
     name: Backend
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@v8.1.0
       - run: cd backend && uv sync --dev
       - run: cd backend && uv run python -m pytest tests/test_regressions.py -v
 
   rust:
     name: Rust check
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Tauri Linux system dependencies
         run: |
           sudo apt-get update
@@ -65,6 +122,8 @@ jobs:
       - run: |
           triple=$(rustc -vV | grep 'host:' | awk '{print $2}')
           mkdir -p src-tauri/resources/backend
-          touch "src-tauri/resources/backend/backend-${triple}"
-          chmod +x "src-tauri/resources/backend/backend-${triple}"
+          touch "src-tauri/resources/backend/jhm-sidecar-${triple}"
+          mkdir -p src-tauri/resources/backend/_internal
+          touch src-tauri/resources/backend/_internal/.ci-placeholder
+          chmod +x "src-tauri/resources/backend/jhm-sidecar-${triple}"
       - run: cd src-tauri && cargo check

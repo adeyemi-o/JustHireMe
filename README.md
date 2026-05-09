@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2ea44f?style=for-the-badge"></a>
+  <a href="LICENSE"><img alt="License: Source-Available Non-Commercial" src="https://img.shields.io/badge/license-source--available%20non--commercial-2ea44f?style=for-the-badge"></a>
   <img alt="Status: Alpha" src="https://img.shields.io/badge/status-alpha-f59e0b?style=for-the-badge">
   <img alt="Local First" src="https://img.shields.io/badge/local--first-yes-0ea5e9?style=for-the-badge">
   <img alt="Desktop: Tauri" src="https://img.shields.io/badge/desktop-Tauri-24c8db?style=for-the-badge">
@@ -25,6 +25,8 @@
   &middot;
   <a href="#quick-start">Quick Start</a>
   &middot;
+  <a href="#agent-skill-and-mcp">Agent Skill + MCP</a>
+  &middot;
   <a href="#contributing">Contributing</a>
   &middot;
   <a href="#roadmap">Roadmap</a>
@@ -34,7 +36,15 @@
 
 ## The Short Version
 
-JustHireMe is an open-source desktop workbench for people who are tired of noisy job boards and black-box AI apply tools.
+JustHireMe is a source-available, non-commercial desktop workbench for people who are tired of noisy job boards and black-box AI apply tools.
+
+## Maintainer And Sponsorship
+
+JustHireMe has started receiving encouraging traction, and I am grateful to everyone who has tried it, shared feedback, or contributed ideas. I built this project while actively looking for funded AI startups hiring for founder, founding engineer, or AI engineer roles where I can work deeply on applied AI products.
+
+If you or someone in your network is hiring for those kinds of roles, I would be happy to connect. You can reach me at [siddhvasudev1402@gmail.com](mailto:siddhvasudev1402@gmail.com), on X/Twitter at [@vasu_devs](https://twitter.com/vasu_devs), or through my portfolio at [vasudev.live](https://vasudev.live).
+
+I am also open to thoughtful sponsorship for JustHireMe as a source-available, non-commercial project. Sponsorship helps keep the project active, improve source coverage, maintain the local-first architecture, and support the work needed to make job search tooling more transparent and useful.
 
 ## Current Status
 
@@ -243,6 +253,18 @@ JustHireMe/
 
 ## Quick Start
 
+### Install On Windows
+
+Use this path if you are not a developer and just want to run JustHireMe.
+
+1. Open the latest [GitHub Release](https://github.com/vasu-devs/JustHireMe/releases/latest).
+2. Download the `JustHireMe_*_x64-setup.exe` installer.
+3. Run the installer.
+4. If Windows SmartScreen appears, click **More info**, then **Run anyway**.
+5. Launch JustHireMe from the Start Menu and follow the setup wizard.
+
+Release notes include SHA256 checksums for the installer assets. The Windows installer is built by GitHub Actions from the release tag so the published binary matches the repository source.
+
 ### Requirements
 
 | Tool | Version |
@@ -312,7 +334,76 @@ The Tauri shell starts the frontend and launches the Python backend sidecar/dev 
 | Frontend build | `npm run build` |
 | Backend tests on Windows | `backend/.venv/Scripts/python.exe -m pytest backend/tests` |
 | Backend tests on macOS/Linux | `backend/.venv/bin/python -m pytest backend/tests` |
+| MCP server on Windows | `backend/.venv/Scripts/python.exe backend/mcp_server.py` |
+| MCP server on macOS/Linux | `backend/.venv/bin/python backend/mcp_server.py` |
 | Rust check | `cd src-tauri && cargo check` |
+
+---
+
+## Agent Skill And MCP
+
+JustHireMe includes two reusable agent surfaces:
+
+- An agent-neutral skill at `skills/justhireme/SKILL.md`
+- A lightweight stdio MCP server at `backend/mcp_server.py`
+
+The skill is plain Markdown with YAML frontmatter. It is written to be useful in any AI coding assistant that can load local instructions, including Claude, Codex, IDE agents, and custom agent runners. It tells an agent how to work safely inside this repository: preserve local-first behavior, keep ranking explainable, treat browser automation as experimental, and use the existing backend/frontend patterns.
+
+### Use The Skill
+
+Point your agent or assistant at:
+
+```text
+skills/justhireme/SKILL.md
+```
+
+If your agent expects skills in a separate directory, copy or symlink the `skills/justhireme` folder into that tool's skill/instruction location. The skill has no runtime dependency on Codex-specific APIs.
+
+### Use The MCP Server
+
+Install backend dependencies first:
+
+```bash
+cd backend
+uv sync --dev
+cd ..
+```
+
+Start the MCP server from the repository root on Windows:
+
+```powershell
+backend\.venv\Scripts\python.exe backend\mcp_server.py
+```
+
+Start it on macOS/Linux:
+
+```bash
+backend/.venv/bin/python backend/mcp_server.py
+```
+
+The MCP server exposes:
+
+| Tool | Purpose |
+| --- | --- |
+| `score_job_fit` | Score a raw job posting against a candidate JSON profile |
+| `evaluate_lead_quality` | Run the deterministic quality gate for a normalized lead |
+| `extract_lead_intel` | Extract company, location, budget, urgency, stack, and signal quality from lead text |
+
+Example MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "justhireme": {
+      "command": "/absolute/path/to/JustHireMe/backend/.venv/bin/python",
+      "args": ["/absolute/path/to/JustHireMe/backend/mcp_server.py"],
+      "cwd": "/absolute/path/to/JustHireMe"
+    }
+  }
+}
+```
+
+On Windows, use the venv interpreter at `backend\\.venv\\Scripts\\python.exe`. More detail: [docs/MCP.md](docs/MCP.md)
 
 ---
 
@@ -414,14 +505,16 @@ Planned improvement:
 
 ## Windows Release Build
 
-The first public packaging target is Windows.
+The first public packaging target is Windows. Public installers are built and published by GitHub Actions when a `v*` tag is pushed.
 
 ```powershell
 .\scripts\build-sidecar.ps1
-npm run tauri build
+npm run package:windows
 ```
 
-Release smoke test: [docs/windows-release.md](docs/windows-release.md)
+For local smoke tests without installer bundling, use `npm run package:fast`.
+
+Release smoke test and packaging details: [docs/windows-release.md](docs/windows-release.md)
 
 ---
 
@@ -454,6 +547,7 @@ Start here:
 | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standards |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design |
 | [docs/source-adapters.md](docs/source-adapters.md) | Scraper adapter contract |
+| [docs/MAINTAINER_RELEASE_CHECKLIST.md](docs/MAINTAINER_RELEASE_CHECKLIST.md) | Release and safety checklist |
 | [ROADMAP.md](ROADMAP.md) | Project direction |
 | [SECURITY.md](SECURITY.md) | Privacy and responsible reporting |
 
@@ -506,7 +600,16 @@ Near-term priorities:
 
 ## License
 
-JustHireMe is released under the [MIT License](LICENSE).
+JustHireMe is released under the [JustHireMe Source-Available Non-Commercial License](LICENSE).
+
+Personal, educational, research, evaluation, and other non-commercial use are
+allowed. Any monetary use is prohibited without express prior written permission
+from Vasudev Siddh or vasu-devs.
+
+Commercial use includes selling, paid services, hosted services, client work,
+business operations, advertising or subscription revenue, commissions, lead
+generation, paid integrations, or any other direct or indirect financial benefit.
+Approved commercial use requires a separate written royalty agreement.
 
 ---
 

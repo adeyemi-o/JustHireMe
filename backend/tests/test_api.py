@@ -137,6 +137,16 @@ class TestAuthGate(unittest.TestCase):
         resp = get("/api/v1/leads")
         self.assertNotEqual(resp.status_code, 401)
 
+    def test_websocket_valid_token_connects(self):
+        with CLIENT.websocket_connect("/ws?token=test-token-abc123") as ws:
+            msg = ws.receive_json()
+        self.assertEqual(msg["type"], "heartbeat")
+
+    def test_websocket_missing_token_closes_without_server_error(self):
+        with self.assertRaises(Exception):
+            with CLIENT.websocket_connect("/ws"):
+                pass
+
 
 class TestHealthEndpoint(unittest.TestCase):
     def test_health_status_code(self):
@@ -305,6 +315,22 @@ class TestPipelineRunEndpoint(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json().get("status"), "started")
+
+
+class TestGenerateEndpoint(unittest.TestCase):
+    def test_generate_waits_for_ready_package(self):
+        ready_lead = {
+            "job_id": "test-generate-001",
+            "resume_asset": "/tmp/resume.pdf",
+            "cover_letter_asset": "/tmp/cover.pdf",
+        }
+        with mock.patch.object(main, "_generate_one", new=mock.AsyncMock(return_value=ready_lead)):
+            resp = post("/api/v1/leads/test-generate-001/generate")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["lead"], ready_lead)
 
 
 class TestIngestionEndpoints(unittest.TestCase):

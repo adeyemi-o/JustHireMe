@@ -22,9 +22,11 @@ import { ProfileView } from "./views/ProfileView";
 import { IngestionView } from "./views/IngestionView";
 import { ApprovalDrawer } from "./components/ApprovalDrawer";
 import { OnboardingWizard } from "./components/OnboardingWizard";
+import { HelpChat } from "./components/HelpChat";
+import { UpdatePrompt } from "./components/UpdatePrompt";
 
 export default function App() {
-  const { conn, port, apiToken, logs, beat, addLog: wsAddLog } = useWS();
+  const { conn, port, apiToken, sidecarError, logs, beat, addLog: wsAddLog } = useWS();
   const api = useMemo<ApiFetch | null>(() => {
     if (!port || !apiToken) return null;
     return (path, opts) => {
@@ -36,7 +38,7 @@ export default function App() {
   const { leads, setLeads, loading: leadsLoading, error: leadsError } = useLeads(api, wsAddLog);
   const dueFollowups = useDueFollowups(api);
   const stats  = useGraphStats(api);
-  const [view, setView]           = useState<View>("apply");
+  const [view, setView]           = useState<View>("dashboard");
   const [sel, setSel]             = useState<Lead | null>(null);
   // Always pass the live version of the selected lead so the drawer reflects real-time updates
   const liveSel = sel ? (leads.find(l => l.job_id === sel.job_id) ?? sel) : null;
@@ -48,18 +50,32 @@ export default function App() {
   const [reevaluating, setReevaluating] = useState(false);
   const [cleaning, setCleaning] = useState(false);
   const [scanErr, setScanErr]     = useState<string | null>(null);
+  const [startupSeconds, setStartupSeconds] = useState(0);
   const closeDrawer = useCallback(() => setSel(null), []);
   const focusApplyView = useCallback(() => {
     setView("apply");
     setApplyAutoFocus(true);
   }, []);
   const openSettings = useCallback(() => setShowSettings(true), []);
+  const openSetupGuide = useCallback(() => {
+    localStorage.removeItem(ONBOARDING_KEY);
+    setShowOnboarding(true);
+  }, []);
 
   useEffect(() => {
     const h = () => setScanning(false);
     window.addEventListener("scan-done", h);
     return () => window.removeEventListener("scan-done", h);
   }, []);
+
+  useEffect(() => {
+    if (api) return;
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      setStartupSeconds(Math.floor((Date.now() - started) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [api]);
 
   useKeyboardShortcuts({
     onEscape: closeDrawer,
@@ -167,9 +183,14 @@ export default function App() {
     accepted:     leads.filter(l=>l.status==="accepted").length,
     rejected:     leads.filter(l=>l.status==="rejected").length,
   };
+
+  if (!api) {
+    return <StartupScreen conn={conn} port={port} seconds={startupSeconds} sidecarError={sidecarError} />;
+  }
+
   return (
     <div style={{ display: "flex", height: "100vh", width: "100vw", overflow: "hidden", alignItems: "stretch" }}>
-      <Sidebar view={view} setView={setView} leadCounts={leadCounts} online={conn === "connected"} port={port} beat={beat} onSettings={() => setShowSettings(true)} />
+      <Sidebar view={view} setView={setView} leadCounts={leadCounts} online={conn === "connected"} port={port} beat={beat} onSettings={() => setShowSettings(true)} onSetup={openSetupGuide} />
       <div className="app-main">
         <Topbar view={view} />
         <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", background: "var(--paper)" }}>
@@ -179,8 +200,8 @@ export default function App() {
           {view === "pipeline"  && <ErrorBoundary label="Pipeline"><PipelineView leads={leads} openDrawer={setSel} deleteLead={deleteLead} port={port} api={api} scanning={scanning} reevaluating={reevaluating} cleaning={cleaning} onReevaluate={onReevaluateJobs} onStopReevaluate={onStopReevaluate} onCleanup={onCleanupLeads} loading={leadsLoading || !port || !api} error={leadsError} /></ErrorBoundary>}
           {view === "graph"     && <ErrorBoundary label="Graph"><GraphView stats={stats} /></ErrorBoundary>}
           {view === "activity"  && <ErrorBoundary label="Activity"><ActivityView logs={logs} /></ErrorBoundary>}
-          {view === "profile"   && port && api && <ErrorBoundary label="Profile"><ProfileView api={api} setView={setView} /></ErrorBoundary>}
-          {view === "ingestion" && port && api && <ErrorBoundary label="Ingestion"><IngestionView api={api} /></ErrorBoundary>}
+          {view === "profile"   && (api ? <ErrorBoundary label="Profile"><ProfileView api={api} setView={setView} /></ErrorBoundary> : <BackendUnavailable title="Profile" conn={conn} port={port} />)}
+          {view === "ingestion" && (api ? <ErrorBoundary label="Ingestion"><IngestionView api={api} /></ErrorBoundary> : <BackendUnavailable title="Add Context" conn={conn} port={port} />)}
         </div>
       </div>
 
@@ -205,6 +226,95 @@ export default function App() {
           />
         )}
       </AnimatePresence>
+      {api && <HelpChat api={api} />}
+      <UpdatePrompt />
+    </div>
+  );
+}
+
+function StartupScreen({ conn, port, seconds, sidecarError }: { conn: string; port: number | null; seconds: number; sidecarError: string | null }) {
+  const isSlow = seconds >= 20;
+  return (
+    <div style={{
+      minHeight: "100vh",
+      width: "100vw",
+      display: "grid",
+      placeItems: "center",
+      background: "var(--paper)",
+      color: "var(--ink)",
+      padding: 24,
+    }}>
+      <section className="card col gap-4" style={{ width: "min(720px, 100%)", padding: 30 }}>
+        <div className="row gap-3">
+          <div className="spinner" />
+          <div>
+            <div className="eyebrow">Starting JustHireMe</div>
+            <h1 style={{ fontSize: 30, marginTop: 6 }}>Preparing your local workspace</h1>
+          </div>
+        </div>
+        <p style={{ color: "var(--ink-2)", lineHeight: 1.6, maxWidth: 620 }}>
+          The desktop app is launching its bundled backend, opening the local database, and waiting for a private API token.
+          The setup guide will appear automatically as soon as the backend is ready.
+        </p>
+        <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+          <span className="pill">Backend: {conn}</span>
+          <span className="pill">Port: {port ?? "pending"}</span>
+          <span className="pill">Elapsed: {seconds}s</span>
+        </div>
+        {isSlow && (
+          <div style={{
+            border: "1px solid var(--line)",
+            borderRadius: 8,
+            padding: 14,
+            background: "var(--paper-3)",
+            color: "var(--ink-2)",
+            lineHeight: 1.55,
+          }}>
+            This is taking longer than expected. If it stays here, the bundled backend failed to start.
+            On macOS, use Privacy &amp; Security &gt; Open Anyway if the app was blocked, then restart JustHireMe.
+          </div>
+        )}
+        {sidecarError && (
+          <div style={{
+            border: "1px solid var(--bad)",
+            borderRadius: 8,
+            padding: 14,
+            background: "var(--bad-soft)",
+            color: "var(--bad)",
+            lineHeight: 1.55,
+            fontFamily: "var(--font-mono)",
+            fontSize: 12,
+            whiteSpace: "pre-wrap",
+          }}>
+            {sidecarError}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function BackendUnavailable({ title, conn, port }: { title: string; conn: string; port: number | null }) {
+  return (
+    <div className="ingestion-page scroll">
+      <div className="ingestion-shell">
+        <div className="card col gap-4" style={{ padding: 28 }}>
+          <div className="row gap-3">
+            <div className="spinner" />
+            <div>
+              <div className="eyebrow">Starting local backend</div>
+              <h2 style={{ marginTop: 6 }}>{title} will appear automatically</h2>
+            </div>
+          </div>
+          <p style={{ color: "var(--ink-2)", maxWidth: 620, lineHeight: 1.6 }}>
+            JustHireMe is waiting for the bundled sidecar to publish its API token and port. This should take a few seconds after launch.
+          </p>
+          <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+            <span className="pill">Connection: {conn}</span>
+            <span className="pill">Port: {port ?? "pending"}</span>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

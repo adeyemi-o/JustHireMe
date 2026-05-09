@@ -1,11 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 import sys
+import site
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 backend_root = Path("backend").resolve()
 if not (backend_root / "main.py").exists():
     backend_root = Path(".").resolve()
+if sys.platform == "win32":
+    venv_site_packages = backend_root / ".venv" / "Lib" / "site-packages"
+else:
+    venv_site_packages = backend_root / ".venv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+site.getusersitepackages = lambda: str(venv_site_packages)
 
 hidden = [
     "uvicorn.logging", "uvicorn.loops", "uvicorn.loops.auto",
@@ -14,35 +21,41 @@ hidden = [
     "uvicorn.protocols.websockets.auto", "uvicorn.lifespan",
     "uvicorn.lifespan.on",
     "fastapi", "fastapi.middleware.cors",
-    "kuzu", "lancedb",
+    "kuzu", "lancedb", "pyarrow",
     "anthropic", "openai", "instructor",
     "langgraph", "langgraph.graph",
-    "sentence_transformers",
-    "playwright", "playwright.sync_api", "playwright.async_api",
     "apscheduler", "apscheduler.schedulers.asyncio",
-    "fpdf2", "fpdf",
+    "fpdf",
     "pypdf", "markdown",
     "tenacity",
     "agents.ingestor", "agents.evaluator", "agents.generator",
     "agents.actuator", "agents.scout", "agents.free_scout",
     "agents.scoring_engine", "agents.semantic", "agents.contact_lookup",
     "agents.lead_intel", "agents.feedback_ranker", "agents.query_gen",
-    "agents.x_scout", "agents.feedback_ranker",
+    "agents.x_scout", "agents.feedback_ranker", "agents.browser_runtime",
     "graph",
     "db.client",
     "llm", "logger",
-]
+] + collect_submodules("playwright") + collect_submodules("lancedb") + collect_submodules("pyarrow")
+
+datas = collect_data_files("playwright") + collect_data_files("lancedb") + collect_data_files("pyarrow")
 
 a = Analysis(
     ["main.py"],
     pathex=[str(backend_root)],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "PIL", "cv2", "torch.distributed"],
+    excludes=[
+        "tkinter", "matplotlib", "PIL", "cv2",
+        "pytest", "tensorboard",
+        "sentence_transformers", "transformers",
+        "torch", "torch.distributed",
+        "sklearn", "scipy",
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -52,20 +65,13 @@ a = Analysis(
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
-    pyz, a.scripts, [],
-    exclude_binaries=True,
+    pyz, a.scripts, a.binaries, a.zipfiles, a.datas,
+    [],
+    exclude_binaries=False,
     name="backend",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     console=True,
-)
-
-coll = COLLECT(
-    exe, a.pure, a.scripts, a.binaries, a.zipfiles, a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="backend",
 )
